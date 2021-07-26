@@ -1,71 +1,132 @@
-from forms import AddTaskForm
+# project/views.py
+
+
+#################
+#### imports ####
+#################
+
+from forms import AddTaskForm, RegisterForm, LoginForm
+
+import datetime
 from functools import wraps
 from flask import Flask, flash, redirect, render_template, \
-request, session, url_for
+    request, session, url_for
+from sqlalchemy.exc import IntegrityError
 from flask_sqlalchemy import SQLAlchemy
 
 
-# config
-app = Flask(__name__) # take the name of the current module
-app.config.from_object('_config') # configuration stuff
-db=SQLAlchemy(app)
+################
+#### config ####
+################
+
+app = Flask(__name__)
+app.config.from_object('_config')
+db = SQLAlchemy(app)
+
+from models import Task, User
 
 
+##########################
+#### helper functions ####
+##########################
 
-# helper functions
-
-
-
-def login_required(test): # check that the user is login
-    @wraps(test) # extend function capabilities
-    def wrap(*args, **kwargs):# when we not sure about the amount of arguments the function will get
-        if 'logged_in' in session: # if the user is logged in
-            return test(*args, **kwargs) # return information
+def login_required(test):
+    @wraps(test)
+    def wrap(*args, **kwargs):
+        if 'logged_in' in session:
+            return test(*args, **kwargs)
         else:
-            flash('You need to login first.') # if not alert the user that he must log in
-            return redirect(url_for('login')) # return him to the login page
+            flash('You need to login first.')
+            return redirect(url_for('login'))
     return wrap
 
 
-# route handlers
-@app.route('/logout/') # routing the logout page
-def logout():
-    session.pop('logged_in', None)  # stop the logged in session and logout the user
-    flash('Goodbye!')
-    return redirect(url_for('login')) # return the user to the login page
+def flash_errors(form):
+    for field, errors in form.errors.items():
+        for error in errors:
+            flash(u"Error in the %s field - %s" % (
+                getattr(form, field).label.text, error), 'error')
 
-@app.route('/', methods=['GET', 'POST']) # routhe the main page , here we will both ask for data and send data
+
+def open_tasks():
+    return db.session.query(Task).filter_by(
+        status='1').order_by(Task.due_date.asc())
+
+
+def closed_tasks():
+    return db.session.query(Task).filter_by(
+        status='0').order_by(Task.due_date.asc())
+
+
+########################
+#### route handlers ####
+########################
+
+@app.route('/logout/')
+@login_required
+def logout():
+    session.pop('logged_in', None)
+    session.pop('user_id', None)
+    session.pop('role', None)
+    flash('Goodbye!')
+    return redirect(url_for('login'))
+
+
+@app.route('/', methods=['GET', 'POST'])
 def login():
-    if request.method == 'POST': # in case we want to send data
-        if request.form['username'] != app.config['USERNAME'] \
-                or request.form['password'] != app.config['PASSWORD']:  # in case the username or password are incorrect return error
-            error = 'Invalid Credentials. Please try again.'
-            return render_template('login.html', error=error)
-    else:
-        session['logged_in'] = True # set the session to login so the user can view his info
-        flash('Welcome!')
-        return redirect(url_for('tasks')) # take him to his tasks page
-    return render_template('login.html')
+    error = None
+    form = LoginForm(request.form)
+    if request.method == 'POST':
+        if form.validate_on_submit():
+            user = User.query.filter_by(name=request.form['name']).first()
+            if user is not None and user.password == request.form['password']:
+                session['logged_in'] = True
+                session['user_id'] = user.id
+                session['role'] = user.role
+                flash('Welcome!')
+                return redirect(url_for('tasks'))
+            else:
+                error = 'Invalid username or password.'
+    return render_template('login.html', form=form, error=error)
+
+
+@app.route('/register/', methods=['GET', 'POST'])
+def register():
+    error = None
+    form = RegisterForm(request.form)
+    if request.method == 'POST':
+        if form.validate_on_submit():
+            new_user = User(
+                form.name.data,
+                form.email.data,
+                form.password.data,
+            )
+            try:
+                db.session.add(new_user)
+                db.session.commit()
+                flash('Thanks for registering. Please login.')
+                return redirect(url_for('login'))
+            except IntegrityError:
+                error = 'That username and/or email already exist.'
+                return render_template('register.html', form=form, error=error)
+    return render_template('register.html', form=form, error=error)
 
 
 @app.route('/tasks/')
 @login_required
 def tasks():
-    open_tasks = db.session.query(Task) \
-        .filter_by(status='1').order_by(Task.due_date.asc())
-    closed_tasks = db.session.query(Task) \
-        .filter_by(status='0').order_by(Task.due_date.asc())
     return render_template(
         'tasks.html',
         form=AddTaskForm(request.form),
-        open_tasks=open_tasks,
-        closed_tasks=closed_tasks
+        open_tasks=open_tasks(),
+        closed_tasks=closed_tasks()
     )
 
-# Add new tasks
-@app.route('/add/', methods=['GET','POST'])
+
+@app.route('/add/', methods=['GET', 'POST'])
 @login_required
 def new_task():
+    error = None
     form = AddTaskForm(request.form)
     if request.method == 'POST':
         if form.validate_on_submit():
@@ -73,31 +134,48 @@ def new_task():
                 form.name.data,
                 form.due_date.data,
                 form.priority.data,
-                '1'
+                datetime.datetime.utcnow(),
+                '1',
+                session['user_id']
             )
             db.session.add(new_task)
             db.session.commit()
             flash('New entry was successfully posted. Thanks.')
-    return redirect(url_for('tasks'))
+            return redirect(url_for('tasks'))
+    return render_template(
+        'tasks.html',
+        form=form,
+        error=error,
+        open_tasks=open_tasks(),
+        closed_tasks=closed_tasks()
+    )
 
 
-# Mark tasks as complete
 @app.route('/complete/<int:task_id>/')
 @login_required
 def complete(task_id):
-   new_id=task_id
-   db.session.query(Task).filter_by(task_id=new_id).update({"status":"0"})
-   db.session.commit()
-   flash('The task is complete')
-   return redirect(url_for('tasks'))
+    new_id = task_id
+    task = db.session.query(Task).filter_by(task_id=new_id)
+    if session['user_id'] == task.first().user_id or session['role'] == "admin":
+        task.update({"status": "0"})
+        db.session.commit()
+        flash('The task is complete. Nice.')
+        return redirect(url_for('tasks'))
+    else:
+        flash('You can only update tasks that belong to you.')
+        return redirect(url_for('tasks'))
 
 
-# Delete Tasks
 @app.route('/delete/<int:task_id>/')
 @login_required
 def delete_entry(task_id):
     new_id = task_id
-    db.session.query(Task).filter_by(task_id=new_id).delete()
-    db.session.commit()
-    flash('The task was deleted. Why not add a new one?')
-    return redirect(url_for('tasks'))
+    task = db.session.query(Task).filter_by(task_id=new_id)
+    if session['user_id'] == task.first().user_id or session['role'] == "admin":
+        task.delete()
+        db.session.commit()
+        flash('The task was deleted. Why not add a new one?')
+        return redirect(url_for('tasks'))
+    else:
+        flash('You can only delete tasks that belong to you.')
+        return redirect(url_for('tasks'))
